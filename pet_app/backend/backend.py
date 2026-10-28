@@ -1,0 +1,806 @@
+# メイン担当:C,D
+
+import asyncio
+import base64
+import io
+import json
+import math
+import os
+import shutil
+import time
+import uuid
+
+from contextlib import asynccontextmanager
+from fastapi import Body, FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from PIL import Image
+from typing import Dict, List
+
+#plot_results.pyからランドマーク描画済み画像を読み込む
+from backend.plot_results import plot_results
+#detect.pyから機械学習モデルを読み込む
+from .detect import load_ml_model, detect_face_and_lndmk
+
+#アクセス履歴保存先
+ID_ACCESS_LOG = {}
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # サーバー起動時にMLモデルをロードする
+    load_ml_model()
+
+    task = asyncio.create_task(cleanup_id())
+    yield
+    task.cancel()
+    if os.path.exists(TEMP_DIR):   # 指定パスが存在するかを確かめる
+        shutil.rmtree(TEMP_DIR)    # サーバーが閉じるとディレクトリを削除
+
+# tempフォルダの画像を定期的に削除
+async def cleanup_id():   # サーバーが開くと同時に１分おきの処理が始まる
+    while True:
+        print("cleanup now")
+        now = time.time() # 現在の時刻を取得
+        
+        #  アクセス履歴(ID_ACCESS_LOG)をチェック
+        for upload_image_id, last_access in list(ID_ACCESS_LOG.items()):
+            
+            # 最後のアクセスから10分以上経過したかチェック
+            if (now - last_access > 600):
+                # 10分以上経過していたら、対応するtempフォルダを削除
+                dir_path = os.path.join(TEMP_DIR, upload_image_id)
+                if os.path.exists(dir_path):
+                    shutil.rmtree(dir_path) # フォルダごと削除
+                    del ID_ACCESS_LOG[upload_image_id] # アクセス履歴からも削除
+                    print(f"ID: {upload_image_id} は古くなったので削除しました。")
+        
+        await asyncio.sleep(60)
+
+# FastAPIアプリの初期化
+app = FastAPI(lifespan=lifespan)
+
+# アップロードされた画像を保存するためのtempディレクトリを作成
+TEMP_DIR = "temp"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+# フロントエンドの静的ファイルを保存するためのwwwディレクトリを作成
+# 例: pet.html, EffectSelect.js, ImageDownload.js, ImageImport.js
+BASE_DIR = os.path.dirname(__file__)  # このファイルがある場所
+WWW_DIR = os.path.join(BASE_DIR, "www")  # backend/www を指定
+
+# /static 配下で www/ のファイルを公開 fastAPI動かす用
+# -> http://localhost:8000/static/pet.html で pet.html が見える
+# -> http://localhost:8000/static/EffectSelect.js でJSが見える
+app.mount("/static", StaticFiles(directory=WWW_DIR), name="static")
+
+# スタンプごとのタイプを設定
+STAMP_PLACEMENT_RULES = {
+    "effect_glasses_1":         {"type": "glasses"},
+    "effect_glasses_1_right":   {"type": "glasses"},
+    "effect_glasses_1_left":    {"type": "glasses"},
+    "effect_glasses_2":         {"type": "glasses"},
+    "effect_glasses_2_right":   {"type": "glasses"},
+    "effect_glasses_2_left":    {"type": "glasses"},
+    "effect_glasses_3":         {"type": "glasses"},
+    "effect_glasses_3_right":   {"type": "glasses"},
+    "effect_glasses_3_left":    {"type": "glasses"},
+    "effect_hat_1":             { "type": "hat" },
+    "effect_hat_2":             { "type": "hat" },
+    "effect_hat_3":             { "type": "hat" },
+    "effect_neck_1":            { "type": "neck" },
+    "effect_neck_2":            { "type": "neck" },
+    "effect_neck_3":            { "type": "neck" },
+    "effect_eye_1":             { "type": "eye" },
+    "effect_eye_1_single":      { "type": "eye" },
+    "effect_eye_2":             { "type": "eye" },
+    "effect_eye_2_right":       { "type": "eye" },
+    "effect_eye_2_left":        { "type": "eye" },
+    "effect_eye_3":             { "type": "eye" },
+    "effect_eye_3_single":      { "type": "eye" },
+    "effect_nose_1":            { "type": "nose" },
+    "effect_nose_2":            { "type": "moustache" }, # moustache = 口ひげ
+    "effect_nose_3":            { "type": "moustache" },
+    "effect_mouth_1":           { "type": "mouth" },
+    "effect_mouth_2":           { "type": "mouth" },
+    "effect_mouth_3":           { "type": "mouth" },
+    "effect_ear_1":             { "type": "ear" },
+    "effect_ear_2":             { "type": "ear" },
+    "effect_ear_3":             { "type": "ear" },
+    "effect_frame_1":           { "type": "frame" },
+    "effect_frame_2":           { "type": "frame" },
+    "effect_frame_3":           { "type": "frame" }
+}
+
+# ちょうどいいスタンプのサイズを計算するために元画像の横幅のpxを設定しておく
+STAMP_PX = {
+    "effect_glasses_1":         1052,
+    "effect_glasses_1_right":   529,
+    "effect_glasses_1_left":    529,
+    "effect_glasses_2":         1000,
+    "effect_glasses_2_right":   498,
+    "effect_glasses_2_left":    498,
+    "effect_glasses_3":         1000,
+    "effect_glasses_3_right":   495,
+    "effect_glasses_3_left":    495,
+    "effect_hat_1":             1000,
+    "effect_hat_2":             1000,
+    "effect_hat_3":             1000,
+    "effect_neck_1":            904,
+    "effect_neck_2":            396,
+    "effect_neck_3":            900,
+    "effect_eye_1":             978,
+    "effect_eye_1_single":      305,
+    "effect_eye_2":             950,
+    "effect_eye_2_right":       269,
+    "effect_eye_2_left":        269,
+    "effect_eye_3":             950,
+    "effect_eye_3_single":      344,
+    "effect_nose_1":            100,
+    "effect_nose_2":            266,
+    "effect_nose_3":            155,
+    "effect_mouth_1":           1024,
+    "effect_mouth_2":           1024,
+    "effect_mouth_3":           500,
+    "effect_ear_1":             915,
+    "effect_ear_2":             1000,
+    "effect_ear_3":             900,
+    "effect_frame_1":           746,
+    "effect_frame_2":           694,
+    "effect_frame_3":           737
+    }
+
+# ユーザーからサーバーへのデータ形式を定義
+class StampRequestData(BaseModel):
+    upload_image_id: str
+    stamp_id: str
+
+# バウンディングボックスとランドマーク９点がリストで返ってくるので、それを使う
+def get_center_landmarks(points: List[List[float]], bbox: List[float]) -> Dict:
+    # 右目の中心座標を計算
+    right_eye_x = (points[0][0] + points[1][0]) / 2
+    right_eye_y = (points[0][1] + points[1][1]) / 2
+
+    # 左目の中心座標を計算
+    left_eye_x = (points[2][0] + points[3][0]) / 2
+    left_eye_y = (points[2][1] + points[3][1]) / 2
+
+    # 頭の中心座標を計算
+    head_x = (bbox[0] + bbox[2]) / 2
+    head_y = bbox[1] + ((bbox[3] - bbox[1]) / 2) #上辺のy座標+(縦幅/2)
+
+    # 右目、左目、鼻、口、頭をランドマーク辞書にする
+    parts_landmarks = {
+        "left_eye": {"x": int(left_eye_x), "y": int(left_eye_y)},
+        "right_eye": {"x": int(right_eye_x), "y": int(right_eye_y)},
+        "nose": {"x": int(points[4][0]), "y": int(points[4][1])},
+        "mouth": {"x": int(points[8][0]), "y": int(points[8][1])},
+        "head": {"x": int(head_x), "y": int(head_y)}
+    }
+    return parts_landmarks
+
+# 画像からランドマークを検出する
+def get_landmarks_from_face(image_path: str) -> Dict | None:
+
+    result_data = detect_face_and_lndmk(image_path, score_threshold= 0.05)
+    if result_data is None:
+        print("❌ モデルが顔を検出できませんでした")
+        return None, None, None
+    
+    result, score = result_data
+
+    if len(result) < 11:
+        print("⚠️ ランドマーク数が不足しています")
+        return None, None, None
+    
+    # バウンディングボックス
+    bbox_top_left = result[0]
+    bbox_bottom_right = result[1]
+    bbox = [bbox_top_left[0], bbox_top_left[1], bbox_bottom_right[0], bbox_bottom_right[1]]
+
+    # ランドマーク
+    raw_landmarks = result[2:11]
+
+    print(f"✅ モデルが顔を検出し、ランドマークを計算しました。 スコア={score: .2f}")
+
+    centers = get_center_landmarks(raw_landmarks, bbox)
+    meta = {
+        "raw_points": raw_landmarks,
+        "bbox": bbox,
+        "score": float(score)
+    }
+    return centers, meta, result
+
+# APIエンドポイントの作成
+@app.get("/")
+def read_root():
+    return RedirectResponse(url="/docs")
+
+# 画像アップロードとランドマーク処理(担当：C)
+@app.post("/upload_and_detect", tags=["1. Image Upload & Landmark Detection"])
+async def upload_and_detect_landmarks(file: UploadFile = File(...)):
+
+    upload_image_id = str(uuid.uuid4())
+    upload_temp_dir = os.path.join(TEMP_DIR, upload_image_id)
+    os.makedirs(upload_temp_dir)
+    original_image_path = os.path.join(upload_temp_dir, "original.jpg")
+    
+    # ファイルを保存
+    with open(original_image_path, "wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+    
+    # MLの推論時間を表示
+    ml_start_time = time.time()
+    centers, meta, result = get_landmarks_from_face(original_image_path)
+    ml_end_time = time.time()
+    print(f"ML推論時間: {(ml_end_time - ml_start_time) * 1000:.2f}ms")
+    
+    # もしMLが失敗したらエラー表示
+    if centers is None:
+        raise HTTPException(status_code=400, detail="ML検出失敗")
+    
+    # centersとmetaをtemp/<upload_id>/landmarks.jsonに保存
+    landmarks_unity = {"centers": centers, "meta": meta}
+    landmarks_JSON_path = os.path.join(upload_temp_dir, "landmarks.json")
+    with open(landmarks_JSON_path, "w", encoding="utf-8") as f:
+        json.dump(landmarks_unity, f, ensure_ascii=False)
+    
+    ID_ACCESS_LOG[upload_image_id] = time.time() # アクセス履歴を残す
+
+    landmark_plot = plot_results(original_image_path, result)
+    buf = io.BytesIO()                      #データ変換の保存先生成
+    landmark_plot.save(buf, format="PNG")   #保存
+    buf.seek(0)                             #保存終了後、先頭に戻す
+    landmark_plot_b64 = base64.b64encode(buf.getvalue()).decode()
+    landmark_plot_uri = f"data:image/png;base64,{landmark_plot_b64}"
+
+    return JSONResponse(content={
+        "upload_image_id": upload_image_id,
+        "landmark_plot": landmark_plot_uri})
+
+
+# スタンプ情報の取得(担当：D)
+@app.post("/get_stamp_info", tags=["2. Get Stamp Info"])
+async def get_stamp_info(data: StampRequestData):
+    """
+    ② ユーザーが加工したいスタンプの名前とIDを受け取る
+    ↓
+    　 IDからランドマークを取得して、適切な座標を取得する
+    ↓
+    　 スタンプの名前とエフェクトを貼る位置とサイズを返す
+    """
+    # temp/<upload_image_id>/landmarks.jsonからランドマークを取得
+    landmarks_unity = os.path.join(TEMP_DIR, data.upload_image_id, "landmarks.json")
+    if not os.path.exists(landmarks_unity):
+        raise HTTPException(status_code=404, detail="長時間操作が無かったため、接続が切れました。再度画像を選択してください。")
+    with open(landmarks_unity, "r", encoding="utf-8") as f:
+        unity = json.load(f)
+    centers = unity.get("centers")
+    meta = unity.get("meta")
+
+    # centers = { left_eye:{x,y}, right_eye:{x,y}, nose:{x,y}, mouth:{x,y} }
+    try:
+        left_eye = centers["left_eye"]
+        right_eye = centers["right_eye"]
+        nose = centers["nose"]
+        mouth = centers["mouth"]
+    except KeyError as e:
+        raise HTTPException(status_code=400, detail=f"必要ランドマーク不足: {e}")
+
+    # ★ ここを追加（bbox の情報を取り出しておく）★
+    bbox = meta.get("bbox")
+    if bbox is not None:
+        x1, y1, x2, y2 = bbox
+        face_w = x2 - x1
+        face_h = y2 - y1
+        face_cx = (x1 + x2) / 2
+
+        # 「目の高さ」を顔の上からだいたい 38% あたりとみなす
+        eye_line_y = y1 + face_h * 0.38
+    else:
+        # 万一 bbox が無ければ、従来通り目のランドマークなどでざっくり代用
+        eye_dist   = abs(right_eye["x"] - left_eye["x"])
+        face_w     = eye_dist * 2.0
+        face_h     = face_w * 1.2
+        face_cx    = (left_eye["x"] + right_eye["x"]) / 2
+        eye_line_y = (left_eye["y"] + right_eye["y"]) / 2
+        
+        # バウンディングボックスがないとき用 担当:C
+        x1 = int(face_cx - face_w / 2)
+        y1 = int(eye_line_y - face_h * 0.4)
+        x2 = int(x1 + face_w)
+        y2 = int(y1 + face_h)
+
+    # 横顔判定 担当:C
+    # 目と目の距離
+    eye_gap = math.sqrt((left_eye["x"] - right_eye["x"])**2 + (left_eye["y"] - right_eye["y"])**2)
+    
+    # 目と目の距離がbbox幅の 25% 未満なら横顔判定
+    profile = (eye_gap / face_w) < 0.25 # profile = 横顔
+
+    # 角度計算
+    if profile: # 横顔のときは顔の角度を0とみなす
+        angle = 0.0
+    else: # 正面顔のときは顔の傾きを算出する
+        dy = left_eye["y"] - right_eye["y"] 
+        dx = left_eye["x"] - right_eye["x"]
+        angle = math.degrees(math.atan2(dy, dx))
+
+
+    # -----------------------------
+    # 2) スタンプ画像読み込み
+    # -----------------------------
+
+    # スタンプのタイプを取得 担当:C
+    stamp_type = STAMP_PLACEMENT_RULES[data.stamp_id]["type"]
+    filename = data.stamp_id
+
+    # メガネと目については横顔の時片目用の画像を使う
+    if profile and (data.stamp_id == "effect_glasses_1" 
+                    or data.stamp_id == "effect_glasses_2" 
+                    or data.stamp_id == "effect_glasses_3" 
+                    or data.stamp_id == "effect_eye_2"):
+        if nose["x"] > face_cx: # 右向き
+            filename = f"{data.stamp_id}_right"
+        else: # 左向き
+            filename = f"{data.stamp_id}_left"
+    
+    if profile and (data.stamp_id == "effect_eye_1" 
+                    or data.stamp_id == "effect_eye_3"):
+        filename = f"{data.stamp_id}_single" # 右も左も同じ画像
+    
+    stamp_path = os.path.join(WWW_DIR, "effect/" + filename + ".png")
+    if not os.path.exists(stamp_path):
+        raise HTTPException(status_code=404, detail=f"スタンプ画像が見つかりません: {stamp_path}")
+
+    # 元画像の横幅
+    with Image.open(stamp_path) as s_img:
+        original_w, original_h = s_img.size
+
+        # 横顔の場合のスタンプ圧縮 担当:C
+        # スタンプごとに圧縮率を設定。
+        compression_rules = {
+            "ear": 0.7, # 耳70%
+            "neck": 0.6, # リボン60%
+            "mouth": 0.7 # 口70%
+        }
+
+        # もし「横顔」かつ「設定リストにあるスタンプ」なら変形する
+        if profile and stamp_type in compression_rules:
+            
+            # スタンプごとに圧縮率を取得
+            rate = compression_rules[stamp_type]
+            
+            new_w = int(original_w * rate)
+            new_h = original_h
+            s_img = s_img.resize((new_w, new_h))
+        
+        # Base64変換
+        buf = io.BytesIO()
+        s_img.save(buf, format="PNG")
+        stamp_image_b64 = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("utf-8")
+        
+        # サイズ情報を更新
+        stamp_w, stamp_h = s_img.size
+
+
+    # 横顔のときの座標計算 担当:D
+    if profile:
+        # -----------------------------
+        # 3) 基本量の計算
+        # -----------------------------
+        eye_dist = abs(right_eye["x"] - left_eye["x"])           # 目と目の距離
+        eye_center_x = (left_eye["x"] + right_eye["x"]) / 2      # 目の中心X
+        eye_center_y = (left_eye["y"] + right_eye["y"]) / 2      # 目の中心Y
+
+        # 生のランドマーク（9 点）も取り出しておく
+        raw_points = meta.get("raw_points", None)
+
+        # 初期値
+        needed_width_px = eye_dist * 1.8   # だいたいいい感じの大きさ
+        x_left = eye_center_x - needed_width_px/2
+        y_top  = eye_center_y - needed_width_px/2
+
+        if stamp_type == "glasses":
+            if (data.stamp_id == "effect_glasses_1" 
+                or data.stamp_id == "effect_glasses_2" 
+                or data.stamp_id == "effect_glasses_3"):
+                if nose["x"] > face_cx: # 右向き
+                    target_eye = left_eye
+                else:
+                    target_eye = right_eye # 左向き
+                
+                eye_center_x = target_eye["x"]
+                eye_center_y = target_eye["y"]
+                needed_width_px = face_w * 0.6
+                aspect = stamp_h / stamp_w
+                glasses_h_scaled = needed_width_px * aspect
+                x_left = eye_center_x - needed_width_px / 2
+                y_top  = eye_center_y - glasses_h_scaled / 2
+
+            else:
+                eye_center_x = (left_eye["x"] + right_eye["x"]) / 2
+                eye_center_y = (left_eye["y"] + right_eye["y"]) / 2
+                needed_width_px = face_w * 0.90
+                aspect = stamp_h / stamp_w
+                glasses_h_scaled = needed_width_px * aspect
+                x_left = eye_center_x - needed_width_px / 2
+                y_top  = eye_center_y - glasses_h_scaled / 2
+        
+        elif stamp_type == "eye":
+            if (data.stamp_id == "effect_eye_1" 
+                or data.stamp_id == "effect_eye_2" 
+                or data.stamp_id == "effect_eye_3"):
+                if nose["x"] > face_cx: # 右向き
+                    target_eye = left_eye
+                else:
+                    target_eye = right_eye # 左向き
+                
+                eye_center_x = (left_eye["x"] + right_eye["x"]) / 2
+                eye_center_y = (left_eye["y"] + right_eye["y"]) / 2
+                needed_width_px = face_w * 0.6
+                aspect = stamp_h / stamp_w
+                glasses_h_scaled = needed_width_px * aspect
+                x_left = eye_center_x - needed_width_px / 2
+                y_top  = eye_center_y - glasses_h_scaled / 2
+
+            else:
+                eye_center_x = (left_eye["x"] + right_eye["x"]) / 2
+                eye_center_y = (left_eye["y"] + right_eye["y"]) / 2
+                needed_width_px = face_w * 0.80
+                aspect = stamp_h / stamp_w
+                glasses_h_scaled = needed_width_px * aspect
+                x_left = eye_center_x - needed_width_px / 2
+                y_top  = eye_center_y - glasses_h_scaled / 2   
+
+        elif stamp_type == "hat":
+            raise HTTPException(status_code=400, detail="横顔には対応していません")
+
+        elif stamp_type == "ear":
+            raise HTTPException(status_code=400, detail="横顔には対応していません")
+
+        elif stamp_type == "nose":
+            needed_width_px = face_w * 0.28   # 鼻飾りなので少し小さめ
+
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            nose_h_scaled = needed_width_px * aspect
+
+            # ランドマーク 6 点（centers["nose"]）の位置に
+            # スタンプ画像の「中心」が来るように配置
+            center_x = nose["x"]
+            center_y = nose["y"]
+
+            x_left = center_x - needed_width_px / 2
+            y_top  = center_y - nose_h_scaled / 2
+        
+        elif stamp_type == "moustache":
+            # 0,1 点（bbox）から顔の横幅を計算 → face_w はすでに計算済み
+            # bbox の横幅に合わせてスタンプ画像をスケーリング
+            needed_width_px = face_w * 0.80  # 鼻飾りなので少し小さめ
+
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            moustache_h_scaled = needed_width_px * aspect
+
+            # ランドマーク 6 点（centers["nose"]）の位置に
+            # スタンプ画像の「中心」が来るように配置
+            center_x = nose["x"]
+            center_y = nose["y"]
+
+            x_left = center_x - needed_width_px / 2
+            y_top  = center_y - moustache_h_scaled / 2
+        
+        elif stamp_type == "mouth":
+            if isinstance(raw_points, list) and len(raw_points) >= 9:
+                mouth_left  = raw_points[5]
+                mouth_right = raw_points[6]
+                mouth_up    = raw_points[7]
+                mouth_down  = raw_points[8]
+            
+                center_x = (mouth_left[0] + mouth_right[0]) / 2.0
+                center_y = (mouth_up[1]   + mouth_down[1]) / 2.0
+            else:
+                # 万一 raw_points が無い場合は、従来どおり mouth 中心を使う
+                center_x = mouth["x"]
+                center_y = mouth["y"]
+
+            # スタンプ画像をスケーリング
+            needed_width_px = face_w * 0.80
+
+            if data.stamp_id == "effect_mouth_3":
+                needed_width_px = face_w * 0.50
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            mouth_h_scaled = needed_width_px * aspect
+            # 9,10 点の中点に、スタンプ画像の中心が来るように配置
+            if nose["x"] > face_cx: # 右向き
+                offset_x = face_cx * 0.1        # 左右のズレが残るなら 0.02 * face_w とか入れて調整
+                x_left = center_x - needed_width_px / 2 + offset_x
+            else: # 左向き
+                offset_x = face_cx * 0.1         # 左右のズレが残るなら 0.02 * face_w とか入れて調整
+                x_left = center_x - needed_width_px / 2 - offset_x
+            offset_y = face_h * 0.1
+            y_top  = center_y - mouth_h_scaled / 2 + offset_y
+        
+        elif stamp_type == "neck":
+            raise HTTPException(status_code=400, detail="横顔には対応していません")
+        
+        elif stamp_type == "frame":
+            original_image_path = os.path.join(
+                TEMP_DIR, data.upload_image_id, "original.jpg"
+                )
+                
+            with Image.open(original_image_path) as base_img:
+                img_w, img_h = base_img.size  # ← 元画像の縦横
+                
+                needed_width_px = img_w
+                x_left = 0
+                y_top  = 0
+                
+                angle = 0.0
+                rotation_center_x = 0.5
+                rotation_center_y = 0.5    
+            
+        else: # その他のスタンプ
+            needed_width_px = face_w * 0.5
+            x_left = face_cx - needed_width_px / 2
+            y_top = (y1 + y2)/2 - needed_width_px / 2
+
+    
+    # 正面顔のとき 担当:D
+    else:
+        # -----------------------------
+        # 3) 基本量の計算
+        # -----------------------------
+        eye_dist = abs(right_eye["x"] - left_eye["x"])           # 目と目の距離
+        eye_center_x = (left_eye["x"] + right_eye["x"]) / 2      # 目の中心X
+        eye_center_y = (left_eye["y"] + right_eye["y"]) / 2      # 目の中心Y
+
+        # 生のランドマーク（9 点）も取り出しておく
+        raw_points = meta.get("raw_points", None)
+
+        # 初期値
+        needed_width_px = eye_dist * 1.8   # だいたいいい感じの大きさ
+        x_left = eye_center_x - needed_width_px/2
+        y_top  = eye_center_y - needed_width_px/2
+        
+        if stamp_type == "glasses":
+            eye_center_x = (left_eye["x"] + right_eye["x"]) / 2
+            eye_center_y = (left_eye["y"] + right_eye["y"]) / 2
+            needed_width_px = face_w * 0.90
+            aspect = stamp_h / stamp_w
+            glasses_h_scaled = needed_width_px * aspect
+            x_left = eye_center_x - needed_width_px / 2
+            y_top  = eye_center_y - glasses_h_scaled / 2
+        
+        elif stamp_type == "eye":
+            eye_center_x = (left_eye["x"] + right_eye["x"]) / 2
+            eye_center_y = (left_eye["y"] + right_eye["y"]) / 2
+            needed_width_px = face_w * 0.80
+            aspect = stamp_h / stamp_w
+            glasses_h_scaled = needed_width_px * aspect
+            x_left = eye_center_x - needed_width_px / 2
+            y_top  = eye_center_y - glasses_h_scaled / 2
+
+        elif stamp_type == "hat":
+            bx1, by1, bx2, by2 = bbox  # [xmin, ymin, xmax, ymax]
+            bbox_w = bx2 - bx1
+            bbox_cx = (bx1 + bx2) / 2   # 横方向の中心
+            bbox_top_y = by1            # 上端の y（ここに帽子の底を合わせたい）
+            
+            width_factor = 1.0          # 1.1 とかにすると少し大きくできる
+            needed_width_px = bbox_w * width_factor
+            aspect = stamp_h / stamp_w
+            hat_h_scaled = needed_width_px * aspect
+            OFFSET_X = 0
+            OFFSET_Y = 0
+            x_center = bbox_cx + OFFSET_X
+            y_bottom = bbox_top_y + OFFSET_Y
+            x_left = x_center - needed_width_px / 2 
+            y_top  = y_bottom - hat_h_scaled
+
+        elif stamp_type == "ear":
+            bx1, by1, bx2, by2 = bbox  # [xmin, ymin, xmax, ymax]
+            bbox_w = bx2 - bx1
+            bbox_cx = (bx1 + bx2) / 2   # 横方向の中心
+            bbox_top_y = by1            # 上端の y
+            
+            width_factor = 1.0          # 1.1 とかにすると少し大きくできる
+            needed_width_px = bbox_w * width_factor
+            aspect = stamp_h / stamp_w
+            OFFSET_X = 0
+            OFFSET_Y = 0
+            x_center = bbox_cx + OFFSET_X
+            y_bottom = bbox_top_y + OFFSET_Y
+            x_left = x_center - needed_width_px / 2
+            y_top = y_bottom - (needed_width_px * aspect)
+
+        elif stamp_type == "nose":
+            # 0,1 点（bbox）から顔の横幅を計算 → face_w はすでに計算済み
+            # bbox の横幅に合わせてスタンプ画像をスケーリング
+            needed_width_px = face_w * 0.28   # 鼻飾りなので少し小さめ
+
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            nose_h_scaled = needed_width_px * aspect
+
+            # ランドマーク 6 点（centers["nose"]）の位置に
+            # スタンプ画像の「中心」が来るように配置
+            center_x = nose["x"]
+            center_y = nose["y"]
+
+            x_left = center_x - needed_width_px / 2
+            y_top  = center_y - nose_h_scaled / 2
+        
+        elif stamp_type == "moustache":
+            # 0,1 点（bbox）から顔の横幅を計算 → face_w はすでに計算済み
+            # bbox の横幅に合わせてスタンプ画像をスケーリング
+            needed_width_px = face_w * 0.80   # 鼻飾りなので少し小さめ
+
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            moustache_h_scaled = needed_width_px * aspect
+
+            # ランドマーク 6 点（centers["nose"]）の位置に
+            # スタンプ画像の「中心」が来るように配置
+            center_x = nose["x"]
+            center_y = nose["y"]
+
+            x_left = center_x - needed_width_px / 2
+            y_top  = center_y - moustache_h_scaled / 2
+
+        elif stamp_type == "mouth":
+            if isinstance(raw_points, list) and len(raw_points) >= 9:
+                mouth_left  = raw_points[5]
+                mouth_right = raw_points[6]
+                mouth_up    = raw_points[7]
+                mouth_down  = raw_points[8]
+            
+                center_x = (mouth_left[0] + mouth_right[0]) / 2.0
+                center_y = (mouth_up[1]   + mouth_down[1]) / 2.0
+            else:
+                # 万一 raw_points が無い場合は、従来どおり mouth 中心を使う
+                center_x = mouth["x"]
+                center_y = mouth["y"]
+
+            # スタンプ画像をスケーリング
+            needed_width_px = face_w * 0.80
+
+            if data.stamp_id == "effect_mouth_3":
+                needed_width_px = face_w * 0.50
+
+            # スケーリング後の高さを計算
+            aspect = stamp_h / stamp_w
+            mouth_h_scaled = needed_width_px * aspect
+
+            offset_x = 0.0         # 左右のズレが残るなら 0.02 * face_w とか入れて調整
+            offset_y = 0.0
+            # 9,10 点の中点に、スタンプ画像の中心が来るように配置
+            x_left = center_x - needed_width_px / 2 + offset_x
+            y_top  = center_y - mouth_h_scaled / 2 + offset_y
+
+        elif stamp_type == "neck":
+            # bbox 底辺の中点を求める
+            bx1, by1, bx2, by2 = bbox
+            bbox_w = bx2 - bx1
+            center_bottom_x = (bx1 + bx2) / 2 
+            bottom_y = by2
+
+            # 0と1点から bbox の横幅はすでに bbox_w で計算済み
+            # bboxの横幅に合わせてスタンプ画像をスケーリング
+            width_factor = 0.5    # 顔幅のどれくらいにするか（0.4〜0.6で微調整）
+            needed_width_px = bbox_w * width_factor
+
+            # スケーリングした画像の高さを取得
+            aspect = stamp_h / stamp_w
+
+            # bbox の下側の中点と、スタンプ画像の「上側の中点」が一致するように配置
+            #    → 上側の中点 = (x_left + needed_width_px/2, y_top)
+            #       これを (center_bottom_x, bottom_y) に合わせる
+            x_left = center_bottom_x - needed_width_px / 2
+            y_top  = bottom_y
+        
+        elif stamp_type == "frame":
+            original_image_path = os.path.join(
+                TEMP_DIR, data.upload_image_id, "original.jpg"
+                )
+                
+            with Image.open(original_image_path) as base_img:
+                img_w, img_h = base_img.size  # ← 元画像の縦横
+                
+                needed_width_px = img_w
+                x_left = 0
+                y_top  = 0 
+                
+                angle = 0.0
+                rotation_center_x = 0.5
+                rotation_center_y = 0.5  
+
+        else:
+            # その他スタンプ（鼻あたり）
+            needed_width_px = eye_dist * 1.0
+            x_left = nose["x"] - needed_width_px/2
+            y_top  = nose["y"] - needed_width_px/2
+
+    # -----------------------------
+    # 5) scale 計算（左上座標に丸め） 担当:D
+    # -----------------------------
+    base_width_px = STAMP_PX.get(filename, stamp_w)
+    if base_width_px <= 0:
+        base_width_px = stamp_w
+    
+    if stamp_type == "frame":
+        scale = max(img_w / stamp_w, img_h / stamp_h)
+    else:
+        scale = needed_width_px / base_width_px
+    # x_int = int(round(x_left))
+    # y_int = int(round(y_top))
+    
+
+    # 角度計算用 担当:C
+    # 実際の表示サイズ（回転の中心計算に必要）
+    final_display_w = stamp_w * scale
+    final_display_h = stamp_h * scale
+    
+    # 回転軸の設定（0.5で中心）
+    rotation_center_x = 0.5
+    rotation_center_y = 0.5
+
+    # スタンプごとの設定
+    if stamp_type == "hat":
+        rotation_center_y = 1.0 # 底辺中心
+
+    elif stamp_type == "ear":
+        rotation_center_y = 1.0 # 底辺中心
+
+    elif stamp_type == "neck":
+        rotation_center_y = 0.0 # 上辺中心
+
+    # 回転軸が割合で計算されていたのをピクセルに変換することで描画できるようにする
+    rotation_center_x_px = final_display_w * rotation_center_x
+    rotation_center_y_px = final_display_h * rotation_center_y
+
+    # 最終的な中心座標の計算
+    final_center_x = x_left + rotation_center_x_px
+    final_center_y = y_top + rotation_center_y_px
+
+    # フレームエフェクトは回転させない
+    if stamp_type == "frame":
+        original_image_path = os.path.join(
+            TEMP_DIR, data.upload_image_id, "original.jpg"
+        )
+        with Image.open(original_image_path) as base_img:
+            img_w, img_h = base_img.size
+            
+        final_center_x = img_w / 2
+        final_center_y = img_h / 2
+        angle = 0.0   # 回転させない
+
+
+    # アクセスログ更新 担当:D
+    ID_ACCESS_LOG[data.upload_image_id] = time.time()
+
+    return JSONResponse(content={
+        "stamp_id": data.stamp_id,
+        "x": int(final_center_x), 
+        "y": int(final_center_y),
+        "scale": scale,
+        "angle": angle,
+        "rotation_center_x": rotation_center_x,
+        "rotation_center_y": rotation_center_y,
+        "stamp_image": stamp_image_b64
+    })
+
+
+# 接続状況確認用POST 担当:B
+@app.post("/check_ID", tags=["α. check_ID"])
+async def check_ID(data: dict = Body(...)):
+    userID = data.get("upload_image_id")
+    user_ID_pass = os.path.join(TEMP_DIR, userID)
+    if not os.path.exists(user_ID_pass):
+        raise HTTPException(status_code=404, detail="長時間操作が無かったため、接続が切れました。再度画像を選択してください。")
+    else:
+        result = True
+
+    return {"result": result}
